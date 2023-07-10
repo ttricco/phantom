@@ -38,17 +38,18 @@ contains
 !----------------------------------------------------------------
 subroutine setpart(id,npart,npartoftype,xyzh,massoftype,vxyzu,polyk,gamma,hfact,time,fileprefix)
  use dim,          only:use_dust,maxdustsmall,maxvxyzu,periodic
- use options,      only:use_dustfrac,nfulldump,beta
+ use options,      only:nfulldump,beta,use_dustfrac
  use setup_params, only:rhozero,npart_total,ihavesetupB
  use io,           only:master
  use unifdis,      only:set_unifdis,latticetype
  use boundary,     only:set_boundary,xmin,ymin,zmin,xmax,ymax,zmax,dxbound,dybound,dzbound
  use mpiutils,     only:bcast_mpi
- use part,         only:Bxyz,mhd,dustfrac,grainsize,graindens,ndusttypes,ndustsmall,igas
+ use part,         only:Bxyz,mhd,dustfrac,grainsize,graindens,ndusttypes,igas,idust,set_particle_type,ndustsmall
  use physcon,      only:pi,solarm,pc,km
  use units,        only:set_units,udist,umass
  use prompting,    only:prompt
- use dust,         only:grainsizecgs,graindenscgs,ilimitdustflux
+ use dust,         only:grainsizecgs,graindenscgs
+ use set_dust_options, only:set_dust_default_options,set_dust_interactively,dust_method,dust_to_gas,ndustsmallinp
  use set_dust,     only:set_dustfrac,set_dustbinfrac
  use timestep,     only:dtmax,tmax
  use table_utils,  only:logspace
@@ -63,11 +64,11 @@ subroutine setpart(id,npart,npartoftype,xyzh,massoftype,vxyzu,polyk,gamma,hfact,
  real,              intent(inout) :: time
  character(len=20), intent(in)    :: fileprefix
  character(len=26)                :: filename
- integer :: i
+ integer :: i, j
  logical :: iexist
  real :: totmass,deltax
  real :: Bz_0
- real :: dust_to_gas,smincgs,smaxcgs,sindex,dustbinfrac(maxdustsmall)
+ real :: smincgs,smaxcgs,sindex,dustbinfrac(maxdustsmall)
 
  print *, ''
  print *, 'Setup for turbulence in a periodic box'
@@ -128,40 +129,24 @@ subroutine setpart(id,npart,npartoftype,xyzh,massoftype,vxyzu,polyk,gamma,hfact,
     print *, 'Setting up dusty turbulence:'
     print *, ''
 
-    !--currently only works with dustfrac
-    use_dustfrac = .true.
+    call set_dust_default_options()
+    call set_dust_interactively()
 
-    dust_to_gas = 1.e-2
-    ndustsmall = 1
-    ilimitdustflux = .false.
-    smincgs = 1.e-5
-    smaxcgs = 1.
-    sindex = 3.5
-    grainsize = 0.
-    graindens = 0.
-
-    call prompt('Enter total dust to gas ratio',dust_to_gas,0.)
-    call prompt('How many grain sizes do you want?',ndustsmall,1,maxdustsmall)
-    ndusttypes = ndustsmall
-    call prompt('Do you want to limit the dust flux?',ilimitdustflux)
-    if (ndusttypes > 1) then
-       !--grainsizes
-       call prompt('Enter minimum grain size in cm',smincgs,0.)
-       call prompt('Enter maximum grain size in cm',smaxcgs,0.)
-       !--mass distribution
-       call prompt('Enter power-law index, e.g. MRN',sindex)
-       call set_dustbinfrac(smincgs,smaxcgs,sindex,dustbinfrac(1:ndusttypes),grainsize(1:ndusttypes))
-       grainsize(1:ndusttypes) = grainsize(1:ndusttypes)/udist
-       !--grain density
-       call prompt('Enter grain density in g/cm^3',graindens(1),0.)
-       graindens(1:ndusttypes) = graindens(1)/umass*udist**3
-    else
-       call prompt('Enter grain size in cm',grainsizecgs,0.)
-       call prompt('Enter grain density in g/cm^3',graindenscgs,0.)
-       grainsize(1) = grainsizecgs/udist
-       graindens(1) = graindenscgs/umass*udist**3
+    if (dust_method == 1) then
+        use_dustfrac = .true.
+        ndusttypes = ndustsmallinp
+        ndustsmall = ndustsmallinp
+        if (ndusttypes > 1) then
+           call set_dustbinfrac(smincgs,smaxcgs,sindex,dustbinfrac(1:ndusttypes),grainsize(1:ndusttypes))
+           grainsize(1:ndusttypes) = grainsize(1:ndusttypes)/udist
+           graindens(1:ndusttypes) = graindens(1)/umass*udist**3
+        else
+           grainsize(1) = grainsizecgs/udist
+           graindens(1) = graindenscgs/umass*udist**3
+        endif
+    elseif (dust_method == 2) then
+        use_dustfrac = .false.
     endif
-
  endif
 
  if (mhd) then
@@ -196,21 +181,41 @@ subroutine setpart(id,npart,npartoftype,xyzh,massoftype,vxyzu,polyk,gamma,hfact,
  massoftype = totmass/npart_total
  print *, ' particle mass = ',massoftype(igas)
 
- do i=1,npart
+ if (use_dust .and. dust_method == 2) then
+     call set_unifdis(latticetype(ilattice),id,master,xmin,xmax,ymin,ymax,zmin,zmax,&
+                      deltax,hfact,npart,xyzh,periodic,nptot=npart_total,mask=i_belong)
+     xyzh(1:3, npartoftype(igas):npart_total) = xyzh(1:3, npartoftype(igas):npart_total) + 0.5 * deltax
+     npartoftype(idust) = npartoftype(igas)
+     massoftype(idust)  = totmass * dust_to_gas / npartoftype(idust)
+     massoftype(igas) = totmass * (1.0 - dust_to_gas) / npartoftype(igas)
+
+     do i=npartoftype(igas)+1, npart_total
+         call set_particle_type(i,idust)
+     enddo
+
+     print *, ' dust particle mass = ',massoftype(idust)
+
+ endif
+
+ do i=1,npartoftype(igas)
+    call set_particle_type(i,igas)
     vxyzu(1:3,i) = 0.
     if (mhd) then
        Bxyz(:,i) = 0.
        Bxyz(3,i) = Bz_0
     endif
-    !--one fluid dust: set dust fraction on gas particles
-    if (use_dust .and. use_dustfrac) then
-       if (ndusttypes > 1) then
-          dustfrac(1:ndusttypes,i) = dust_to_gas*dustbinfrac(1:ndusttypes)
-       else
-          call set_dustfrac(dust_to_gas,dustfrac(:,i))
-       endif
+
+    if (use_dust .and. dust_method == 1) then
+        if (ndusttypes > 1) then
+            dustfrac(1:ndusttypes,i) = dust_to_gas*dustbinfrac(1:ndusttypes)
+        else
+            call set_dustfrac(dust_to_gas,dustfrac(:,i))
+        endif
     endif
  enddo
+
+ totmass = npartoftype(igas) * massoftype(igas) + npartoftype(idust) * massoftype(idust)
+ print *, ' total mass = ', totmass
 
  if (mhd) ihavesetupB = .true.
 
